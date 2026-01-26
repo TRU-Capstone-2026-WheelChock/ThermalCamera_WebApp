@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thermal Data Collector</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #f0f0f0; }
+        h1 { color: #333; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        img { border: 2px solid #333; border-radius: 4px; max-width: 100%; }
+        .controls { margin-top: 20px; display: flex; justify-content: center; gap: 10px; }
+        input[type="text"] { padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:active { background-color: #0056b3; }
+        #result_box { margin-top: 15px; font-weight: bold; height: 20px; color: green; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Thermal Data Collector</h1>
+        
+        <div>
+            <img src="/video_feed" alt="Thermal Stream">
+        </div>
+
+        <div class="controls">
+            <input type="text" id="label" value="class_1" placeholder="Label Name">
+            <button onclick="saveData()">Save (Enter)</button>
+        </div>
+
+        <div id="result_box"></div>
+    </div>
+
+    <script>
+        async function saveData() {
+            const label = document.getElementById('label').value;
+            const result_label = document.getElementById('result_box');
+            
+            try {
+                const response = await fetch('/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ label: label })
+                });
+                
+                const data = await response.json();
+                if (data.status === 'saved') {
+                    result_label.innerText = `Saved: ${label} at ${new Date().toLocaleTimeString()}`;
+                    result_label.style.color = 'green';
+                } else {
+                    result_label.innerText = 'Error saving data';
+                    result_label.style.color = 'red';
+                }
+            } catch (e) {
+                console.error(e);
+                result_label.innerText = 'Connection Error';
+                result_label.style.color = 'red';
+            }
+            setTimeout(() => { result_label.innerText = ''; }, 10000);//Display 
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                saveData();
+            }
+        });
+    </script>
+</body>
+</html>
