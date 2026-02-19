@@ -1,105 +1,162 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-from Img_predictor import Img_predictor
-import csv
 import os
 import time
-import datetime
-import threading
+import signal
 import logging
+from datetime import datetime
 
-IN_DOCKER = os.path.exists('/dockerenv')
-if IN_DOCKER:
-    print("Runing in Docker container")
-    os.environ['BLIKNA_FORCEBOARD'] = 'RASPBERRY_PI_4B'
-    os.environ['BLINKA_FORCECHIP'] = 'BCM2XXX'
-    
-logger = logging.getLogger("FastAPI_Server")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from Img_predictor import Img_predictor
+from thermal_publisher import ThermalPublisher
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    print("shutting down camera...")
-    os.exit(0)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('thermal_service.log')
+    ]
+)
+logger = logging.getLogger("ThermalMain")
 
-app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
+should_exit = False
 
-try:
-    camera = Img_predictor()
-except Exception as e:
-    logger.critical(f"Failed to start camera. Exiting.{e}")
-    exit(1)
+def signal_handler(signum, frame):
+    global should_exit
+    logger.info(f"Received signal {signum}, shutting down...")
+    should_exit = True
 
-latest_raw_data = None
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-DATA_DIR = 'dataset'
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-    logger.info(f"Created data directory: {DATA_DIR}")
 
-HEADER = ['timestamp', 'label'] + [f'pix_{i}' for i in range(768)]
+class ThermalService:
+    def __init__(self):
+        self.publish_interval = float(os.getenv("PUBLISH_INTERVAL", "1.0"))
+        self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
+        self.mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-def gen_frames():
-    global latest_raw_data
-    while True:
-        frame_bytes, raw_data = camera.camera()
-        if frame_bytes:
-            latest_raw_data = raw_data
-            yield(
-                b'--frame\r\n'
-                b'Content-Type: image/jpg\r\n\r\n' + frame_bytes + b'\r\n'
-            )
-        else:
-            time.sleep(0.1)
-    
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+        self.camera = None
+        self.publisher = None
 
-@app.get("/video_feed")
-async def video_feed():
-    return StreamingResponse(gen_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+        self.frame_count = 0
+        self.start_time = None
 
-@app.post("/save")
-async def seve_data(request: Request, backgorund_tasks: BackgroundTasks):
-    global latest_raw_data
-    
-    body = await request.json()
+        logger.info("=" * 50)
+        logger.info("Thermal Service Started")
+        logger.info(f"Publish Interval: {self.publish_interval}s")
+        logger.info(f"Heartbeat Interval: {self.heartbeat_interval}s")
+        logger.info(f"Mock Mode: {self.mock_mode}")
+        logger.info("=" * 50)
 
-    label = body.get("label", "unknown")
+    def init_camera(self):
+        try:
+            if self.mock_mode:
+                logger.info("Running in mock mode")
+                self.camera = Img_predictor()
+            else:
+                self.camera = Img_predictor()
+            logger.info("Camera initialized")
+            return True
+        except Exception as e:
+            logger.error(f"Camera init failed: {e}")
+            if not self.mock_mode:
+                logger.warning("Falling back to mock mode")
+                self.mock_mode = True
+                return self.init_camera()
+            return False
 
-    if latest_raw_data is None:
-        return JSONResponse({"error": "No data available"})
-    
-    try:
-        data_to_save = list(latest_raw_data)
-        now = datetime.datetime.now()
-        timestamp_val = now.timestamp()
-        time_str = now.strftime("%Y%m%d_%H%M%S_%f")[:-5]
-        filename = f"{label}_{time_str}.csv"
-        filepath = os.path.join(DATA_DIR, filename)
+    def init_publisher(self):
+        self.publisher = ThermalPublisher()
+        try:
+            self.publisher.connect()
+            return True
+        except Exception as e:
+            logger.error(f"Publisher connect failed: {e}")
+            return False
 
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(HEADER)
-            writer.writerow([timestamp_val, label] + data_to_save)
-        
-        y_pred = camera.predict_from_camera()
-        
-        logger.info(f"Saved: {filename}")
-        
-        return {"Status": "saved", "filename": filename}
+    def capture_and_send(self):
+        try:
+            frame_bytes, raw_data = self.camera.camera()
+            if frame_bytes is None:
+                logger.warning("Capture failed")
+                return False
 
-    except Exception as e:
+            prediction = None
+            try:
+                if hasattr(self.camera, 'predict_from_camera'):
+                    prediction = self.camera.predict_from_camera()
+                    if hasattr(prediction, 'item'):
+                        prediction = prediction.item()
+            except Exception as e:
+                logger.error(f"Prediction error: {e}")
 
-        logger.error(f"Error saving data: {e}")
+            metadata = {
+                "device_id": self.publisher.device_id,
+                "device_name": self.publisher.device_name,
+                "timestamp": datetime.now().isoformat(),
+                "frame_number": self.frame_count,
+                "prediction": prediction,
+                "has_human": bool(prediction) if prediction is not None else False
+            }
 
-        return JSONResponse(status_code=500, content={"message": str(e)})
+            self.publisher.send_image_frame(frame_bytes, metadata)
+
+            self.publisher.send_prediction(prediction, metadata)
+
+            self.frame_count += 1
+            if self.frame_count % 10 == 0:
+                logger.info(f"Sent {self.frame_count} frames")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error in capture_and_send: {e}")
+            return False
+
+    def run(self):
+        if not self.init_camera():
+            logger.critical("Camera init failed, exiting")
+            return
+
+        if not self.init_publisher():
+            logger.critical("Publisher init failed, exiting")
+            return
+
+        self.start_time = time.time()
+        last_heartbeat = time.time()
+
+        try:
+            while not should_exit:
+                loop_start = time.time()
+
+                self.capture_and_send()
+
+                now = time.time()
+                if now - last_heartbeat >= self.heartbeat_interval:
+                    self.publisher.send_heartbeat()
+                    last_heartbeat = now
+
+                elapsed = time.time() - loop_start
+                sleep_time = max(0, self.publish_interval - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    logger.warning(f"Processing took {elapsed:.3f}s > interval {self.publish_interval}s")
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        logger.info("Cleaning up...")
+        if self.publisher:
+            self.publisher.close()
+        if hasattr(self.camera, 'close'):
+            self.camera.close()
+        elif hasattr(self.camera, 'release'):
+            self.camera.release()
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        logger.info(f"Stopped. Frames sent: {self.frame_count}, uptime: {elapsed:.1f}s")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1)
+    service = ThermalService()
+    service.run()
