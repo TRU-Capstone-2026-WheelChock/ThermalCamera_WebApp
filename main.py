@@ -30,8 +30,8 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 class ThermalService:
     def __init__(self):
-        self.publish_interval = float(os.getenv("PUBLISH_INTERVAL", "1.0"))
-        self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
+        self.publish_interval = float(os.getenv("PUBLISH_INTERVAL", "2.0"))
+        # self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
         self.mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
 
         self.camera = None
@@ -43,7 +43,7 @@ class ThermalService:
         logger.info("=" * 50)
         logger.info("Thermal Service Started")
         logger.info(f"Publish Interval: {self.publish_interval}s")
-        logger.info(f"Heartbeat Interval: {self.heartbeat_interval}s")
+        # logger.info(f"Heartbeat Interval: {self.heartbeat_interval}s")
         logger.info(f"Mock Mode: {self.mock_mode}")
         logger.info("=" * 50)
 
@@ -121,7 +121,7 @@ class ThermalService:
             return
 
         self.start_time = time.time()
-        last_heartbeat = time.time()
+        # last_heartbeat = time.time()
 
         try:
             while not should_exit:
